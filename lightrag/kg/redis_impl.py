@@ -1065,8 +1065,10 @@ class RedisDocStatusStorage(DocStatusStorage):
             file_path: The file path to search for
 
         Returns:
-            Union[dict[str, Any], None]: Document data if found, None otherwise
-            Returns the same format as get_by_id method
+            Union[dict[str, Any], None]: Document data if found, None otherwise.
+            The dict mirrors get_by_id output and includes an "id" key holding
+            the document identifier (the suffix of the Redis key after the
+            namespace prefix).
         """
         async with self._get_redis_connection() as redis:
             try:
@@ -1077,19 +1079,29 @@ class RedisDocStatusStorage(DocStatusStorage):
                         cursor, match=f"{self.final_namespace}:*", count=1000
                     )
                     if keys:
-                        # Get all values in batch
+                        # Get all values in batch, preserving order so we can
+                        # zip them back to the originating keys to recover the
+                        # doc id (suffix after the namespace prefix).
                         pipe = redis.pipeline()
                         for key in keys:
                             pipe.get(key)
                         values = await pipe.execute()
 
-                        # Check each document for matching file_path
-                        for value in values:
+                        for key, value in zip(keys, values):
                             if value:
                                 try:
                                     doc_data = json.loads(value)
                                     if doc_data.get("file_path") == file_path:
-                                        return doc_data
+                                        # redis keys may be bytes when
+                                        # decode_responses=False; coerce both
+                                        # cases via split-on-first-colon.
+                                        key_str = (
+                                            key.decode("utf-8")
+                                            if isinstance(key, (bytes, bytearray))
+                                            else key
+                                        )
+                                        doc_id = key_str.split(":", 1)[1]
+                                        return {"id": doc_id, **doc_data}
                                 except json.JSONDecodeError as e:
                                     logger.error(
                                         f"[{self.workspace}] JSON decode error in get_doc_by_file_path: {e}"

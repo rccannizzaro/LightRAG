@@ -870,8 +870,10 @@ class DocStatusStorage(BaseKVStorage, ABC):
             file_path: The file path to search for
 
         Returns:
-            dict[str, Any] | None: Document data if found, None otherwise
-            Returns the same format as get_by_ids method
+            dict[str, Any] | None: Document data if found, None otherwise.
+            The dict mirrors the format produced by get_by_ids and additionally
+            includes an "id" key with the document identifier so callers can
+            resolve the doc_id without a second lookup.
         """
 
 

@@ -960,7 +960,12 @@ class OpenSearchDocStatusStorage(DocStatusStorage):
             return {}
 
     async def get_doc_by_file_path(self, file_path: str) -> Union[dict[str, Any], None]:
-        """Find a document status record by its file_path field."""
+        """Find a document status record by its file_path field.
+
+        The returned dict mirrors get_by_id output and includes an "id" key
+        holding the document identifier (OpenSearch's _id) so callers can
+        resolve the doc_id without a second lookup.
+        """
         if not self._index_ready:
             return None
         try:
@@ -969,7 +974,7 @@ class OpenSearchDocStatusStorage(DocStatusStorage):
             hits = response["hits"]["hits"]
             if hits:
                 doc = hits[0]["_source"]
-                doc["_id"] = hits[0]["_id"]
+                doc["id"] = hits[0]["_id"]
                 return doc
             return None
         except OpenSearchException as e:

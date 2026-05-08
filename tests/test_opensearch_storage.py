@@ -962,7 +962,7 @@ class TestDocStatusStorage:
             await s.initialize()
             doc = await s.get_doc_by_file_path("/test.txt")
             assert doc is not None
-            assert doc["_id"] == "d1"
+            assert doc["id"] == "d1"
 
     @pytest.mark.asyncio
     async def test_get_doc_by_file_path_not_found(

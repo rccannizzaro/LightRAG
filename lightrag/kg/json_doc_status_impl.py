@@ -380,8 +380,9 @@ class JsonDocStatusStorage(DocStatusStorage):
             file_path: The file path to search for
 
         Returns:
-            Union[dict[str, Any], None]: Document data if found, None otherwise
-            Returns the same format as get_by_ids method
+            Union[dict[str, Any], None]: Document data if found, None otherwise.
+            The dict mirrors get_by_ids output and includes an "id" key holding
+            the document identifier (the storage key for this backend).
         """
         if self._storage_lock is None:
             raise StorageNotInitializedError("JsonDocStatusStorage")
@@ -389,8 +390,7 @@ class JsonDocStatusStorage(DocStatusStorage):
         async with self._storage_lock:
             for doc_id, doc_data in self._data.items():
                 if doc_data.get("file_path") == file_path:
-                    # Return complete document data, consistent with get_by_ids method
-                    return doc_data
+                    return {"id": doc_id, **doc_data}
 
         return None
 

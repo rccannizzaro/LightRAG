@@ -737,10 +737,20 @@ class MongoDocStatusStorage(DocStatusStorage):
             file_path: The file path to search for
 
         Returns:
-            Union[dict[str, Any], None]: Document data if found, None otherwise
-            Returns the same format as get_by_id method
+            Union[dict[str, Any], None]: Document data if found, None otherwise.
+            The dict mirrors get_by_id output and includes an "id" key holding
+            the document identifier (Mongo's _id, the doc_id). The native "_id"
+            key is omitted to keep the response shape backend-agnostic.
         """
-        return await self._data.find_one({"file_path": file_path})
+        doc = await self._data.find_one({"file_path": file_path})
+        if doc is None:
+            return None
+        # Mongo stores the doc_id in _id (see upsert calls). Promote it to "id"
+        # so the API surface matches other storage backends.
+        doc_id = doc.pop("_id", None)
+        if doc_id is not None:
+            doc["id"] = doc_id
+        return doc
 
 
 @final
