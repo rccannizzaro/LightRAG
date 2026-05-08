@@ -19,6 +19,7 @@ from fastapi import (
     Depends,
     File,
     HTTPException,
+    Query,
     UploadFile,
 )
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -3293,6 +3294,64 @@ def create_document_routes(
                 total_elapsed,
             )
             logger.error(f"Error getting paginated documents: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @router.get(
+        "/by_file_path",
+        response_model=Optional[DocStatusResponse],
+        dependencies=[Depends(combined_auth)],
+    )
+    async def get_document_by_file_path(
+        file_path: str = Query(
+            ...,
+            min_length=1,
+            description=(
+                "Exact match against the document's stored file_path. "
+                "Case-sensitive."
+            ),
+        ),
+    ) -> Optional[DocStatusResponse]:
+        """
+        Look up a single document by its file_path.
+
+        Avoids paginating /documents/paginated when the caller only needs to
+        check whether a specific file is already indexed (e.g. ingestion
+        pre-flight or manifest reconciliation). The doc_status storage
+        primitive that backs this endpoint already exists for internal upload
+        dedup; this route just exposes it.
+
+        Returns:
+            DocStatusResponse if a document with the given file_path exists,
+            otherwise null (HTTP 200 with body `null`).
+
+        Raises:
+            HTTPException: 422 if file_path is missing/empty (FastAPI
+                validation); 500 on storage error.
+        """
+        try:
+            doc_data = await rag.doc_status.get_doc_by_file_path(file_path)
+            if doc_data is None:
+                return None
+            return DocStatusResponse(
+                id=doc_data["id"],
+                content_summary=doc_data.get("content_summary", ""),
+                content_length=doc_data.get("content_length", 0),
+                status=doc_data["status"],
+                created_at=format_datetime(doc_data.get("created_at")),
+                updated_at=format_datetime(doc_data.get("updated_at")),
+                track_id=doc_data.get("track_id"),
+                chunks_count=doc_data.get("chunks_count"),
+                error_msg=doc_data.get("error_msg"),
+                metadata=doc_data.get("metadata"),
+                file_path=normalize_file_path(
+                    doc_data.get("file_path", file_path)
+                ),
+            )
+        except Exception as e:
+            logger.error(
+                f"Error getting document by file_path {file_path!r}: {str(e)}"
+            )
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e))
 
