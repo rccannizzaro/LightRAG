@@ -1918,6 +1918,7 @@ async def background_delete_documents(
                     doc_id,
                     delete_llm_cache=delete_llm_cache,
                     skip_rebuild=True,
+                    skip_persist=True,
                 )
                 file_path = (
                     getattr(result, "file_path", "-") if "result" in locals() else "-"
@@ -2123,7 +2124,6 @@ async def background_delete_documents(
                         entity_chunks_storage=rag.entity_chunks,
                         relation_chunks_storage=rag.relation_chunks,
                     )
-                    await rag._insert_done()
                 except Exception as rebuild_err:
                     rebuild_ok = False
                     rebuild_error_msg = f"Failed to rebuild knowledge graph after batch deletion: {rebuild_err}"
@@ -2132,6 +2132,26 @@ async def background_delete_documents(
                     async with pipeline_status_lock:
                         pipeline_status["latest_message"] = rebuild_error_msg
                         pipeline_status["history_messages"].append(rebuild_error_msg)
+
+        # --- W6: end-of-batch storage flush.
+        # Per-doc adelete_by_doc_id(skip_persist=True) deferred all
+        # `_insert_done()` calls to amortize JSON KV store rewrites
+        # (~74 MB/doc → 14 GB across a 200-doc batch). Flush exactly once
+        # here so all storages catch up before the doc_status finalization
+        # below. This MUST run regardless of whether the rebuild step fired
+        # — without rebuild targets, no flush would happen otherwise.
+        if successful_deletions:
+            try:
+                await rag._insert_done()
+            except Exception as flush_err:
+                logger.error(
+                    f"End-of-batch storage flush failed: {flush_err}"
+                )
+                logger.error(traceback.format_exc())
+                async with pipeline_status_lock:
+                    pipeline_status["history_messages"].append(
+                        f"Warning: end-of-batch flush failed: {flush_err}"
+                    )
 
         # --- Issue 2: only finalize doc_status removal after rebuild succeeds.
         # adelete_by_doc_id(skip_rebuild=True) intentionally keeps doc_status

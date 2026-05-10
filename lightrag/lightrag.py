@@ -3225,6 +3225,7 @@ class LightRAG:
         doc_id: str,
         delete_llm_cache: bool = False,
         skip_rebuild: bool = False,
+        skip_persist: bool = False,
     ) -> DeletionResult:
         """Delete a document and all its related data, including chunks, graph elements.
 
@@ -3261,6 +3262,12 @@ class LightRAG:
                 The caller is responsible for performing a single deferred rebuild
                 using the entities/relationships returned in the DeletionResult.
                 Used by batch deletion to avoid N redundant rebuilds. Defaults to False.
+            skip_persist (bool): When True, skip the per-document
+                `_insert_done()` storage flush. The caller is responsible for
+                calling `_insert_done()` exactly once at the end of the batch.
+                Used by batch deletion to avoid N file-based KV store rewrites
+                (which dominate per-doc cost once graph + vectors are migrated
+                to real DBs). Defaults to False.
 
         Returns:
             DeletionResult: An object containing the outcome of the deletion process.
@@ -3944,13 +3951,17 @@ class LightRAG:
                     logger.error(f"Failed to delete entities: {e}")
                     raise Exception(f"Failed to delete entities: {e}") from e
 
-            # Persist changes to graph database before entity and relationship rebuild
-            try:
-                deletion_stage = "persist_pre_rebuild_changes"
-                await self._insert_done()
-            except Exception as e:
-                logger.error(f"Failed to persist pre-rebuild changes: {e}")
-                raise Exception(f"Failed to persist pre-rebuild changes: {e}") from e
+            # Persist changes to graph database before entity and relationship rebuild.
+            # Under skip_persist=True (batch deletion), the caller flushes once at
+            # end-of-batch — the rebuild step (or its skip path) sees correct
+            # in-memory state without needing a per-doc disk write here.
+            if not skip_persist:
+                try:
+                    deletion_stage = "persist_pre_rebuild_changes"
+                    await self._insert_done()
+                except Exception as e:
+                    logger.error(f"Failed to persist pre-rebuild changes: {e}")
+                    raise Exception(f"Failed to persist pre-rebuild changes: {e}") from e
 
             # 8. Rebuild entities and relationships from remaining chunks
             #    When skip_rebuild is set (batch deletion), we hand the targets back
@@ -4115,18 +4126,33 @@ class LightRAG:
         finally:
             # ALWAYS ensure persistence if any deletion operations were started.
             #
-            # When the doc had no chunks (FAILED ingest cleanup), only
-            # doc_status, full_docs, and optionally llm_response_cache were
-            # touched — none of the graph/VDB/chunk storages were mutated.
-            # `_insert_done()` would still rewrite all of them (the graph alone
-            # is ~62 MB GraphML, vdb_*.json files are ~500 MB each), turning a
-            # bulk-delete of N FAILED docs into N × 1.5 GB of pure no-op disk
-            # writes. The per-storage `index_done_callback()` implementations
-            # do not currently track dirtiness, so we filter at the call site.
+            # `skip_persist=True` (W6) tells us the CALLER will flush all
+            # storages once at the end of a batch — for example,
+            # `background_delete_documents` accumulates per-doc graph + KV +
+            # VDB mutations across the whole batch and calls `_insert_done()`
+            # exactly once at the end. Without this, every doc in a 200-doc
+            # batch rewrites the JSON KV stores in their entirety
+            # (~74 MB × 200 = 14 GB of pointless I/O even with Memgraph +
+            # Qdrant migrated). The W2 deferred-rebuild patch already
+            # consolidated the LLM-driven graph rebuild step end-of-batch;
+            # this consolidates the storage flush too.
+            #
+            # When the doc had no chunks (FAILED ingest cleanup) AND
+            # skip_persist is False, only doc_status, full_docs, and
+            # optionally llm_response_cache were touched — none of the
+            # graph/VDB/chunk storages were mutated. `_insert_done()` would
+            # still rewrite all of them. The per-storage
+            # `index_done_callback()` implementations do not currently track
+            # dirtiness, so we filter at the call site.
             #
             # When chunks WERE processed, the graph + VDBs were genuinely
             # mutated and must be persisted — fall back to the full path.
-            if deletion_operations_started:
+            if deletion_operations_started and skip_persist:
+                logger.debug(
+                    f"Skipping per-doc persist for {doc_id} (skip_persist=True); "
+                    "caller will flush at end of batch"
+                )
+            elif deletion_operations_started:
                 try:
                     if chunk_ids:
                         await self._insert_done()
