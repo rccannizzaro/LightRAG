@@ -4113,10 +4113,40 @@ class LightRAG:
             )
 
         finally:
-            # ALWAYS ensure persistence if any deletion operations were started
+            # ALWAYS ensure persistence if any deletion operations were started.
+            #
+            # When the doc had no chunks (FAILED ingest cleanup), only
+            # doc_status, full_docs, and optionally llm_response_cache were
+            # touched — none of the graph/VDB/chunk storages were mutated.
+            # `_insert_done()` would still rewrite all of them (the graph alone
+            # is ~62 MB GraphML, vdb_*.json files are ~500 MB each), turning a
+            # bulk-delete of N FAILED docs into N × 1.5 GB of pure no-op disk
+            # writes. The per-storage `index_done_callback()` implementations
+            # do not currently track dirtiness, so we filter at the call site.
+            #
+            # When chunks WERE processed, the graph + VDBs were genuinely
+            # mutated and must be persisted — fall back to the full path.
             if deletion_operations_started:
                 try:
-                    await self._insert_done()
+                    if chunk_ids:
+                        await self._insert_done()
+                    else:
+                        no_chunks_storages = [self.doc_status, self.full_docs]
+                        if (
+                            delete_llm_cache
+                            and metadata_cache_ids
+                            and self.llm_response_cache is not None
+                        ):
+                            no_chunks_storages.append(self.llm_response_cache)
+                        await asyncio.gather(
+                            *(
+                                cast(
+                                    StorageNameSpace, s
+                                ).index_done_callback()
+                                for s in no_chunks_storages
+                                if s is not None
+                            )
+                        )
                 except Exception as persistence_error:
                     persistence_error_msg = f"Failed to persist data after deletion attempt for {doc_id}: {persistence_error}"
                     logger.error(persistence_error_msg)
