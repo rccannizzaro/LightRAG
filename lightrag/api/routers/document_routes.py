@@ -2517,57 +2517,111 @@ def create_document_routes(
             HTTPException: If an error occurs during text processing (500).
         """
         try:
-            # Check if any file_sources already exist in doc_status storage
-            if request.file_sources:
-                for file_source in request.file_sources:
-                    if (
-                        file_source
-                        and file_source.strip()
-                        and file_source != "unknown_source"
-                    ):
-                        existing_doc_data = await rag.doc_status.get_doc_by_file_path(
-                            file_source
-                        )
-                        if existing_doc_data:
-                            # Get document status and track_id from existing document
-                            status = existing_doc_data.get("status", "unknown")
-                            # Use `or ""` to handle both missing key and None value (e.g., legacy rows without track_id)
-                            existing_track_id = existing_doc_data.get("track_id") or ""
-                            return InsertResponse(
-                                status="duplicated",
-                                message=f"File source '{file_source}' already exists in document storage (Status: {status}).",
-                                track_id=existing_track_id,
-                            )
+            # Per-doc dedup with partial-success semantics.
+            #
+            # Previous behavior: a single duplicate (by file_source OR by
+            # content hash) caused the WHOLE batch to short-circuit with
+            # status="duplicated" — silently dropping every other doc in
+            # the request, even when N-1 of them were genuinely new.
+            #
+            # New behavior: each doc is checked independently. Duplicates
+            # are skipped (with a per-doc message), non-duplicates are
+            # enqueued. The response status reflects the mix:
+            #   - "success"          → all docs were new and enqueued
+            #   - "partial_success"  → some new, some duplicates skipped
+            #   - "duplicated"       → every doc in the batch was a dup
+            #                          (preserves backward-compat callers
+            #                          that special-case all-dup batches)
+            #
+            # Dup detection still runs on file_source first (cheap path
+            # match), then on content hash (sanitized + MD5) for the docs
+            # that survive the file_source check.
+            file_sources_in = request.file_sources or [None] * len(request.texts)
+            new_texts: list[str] = []
+            new_sources: list[str | None] = []
+            skipped_messages: list[str] = []
 
-            # Check if any content already exists by computing content hash (doc_id)
-            for text in request.texts:
+            for text, file_source in zip(request.texts, file_sources_in):
+                # Check 1: file_source already in doc_status?
+                if (
+                    file_source
+                    and file_source.strip()
+                    and file_source != "unknown_source"
+                ):
+                    existing = await rag.doc_status.get_doc_by_file_path(file_source)
+                    if existing:
+                        skipped_messages.append(
+                            f"file_source '{file_source}' already exists "
+                            f"(status: {existing.get('status', 'unknown')})"
+                        )
+                        continue
+                # Check 2: content already in doc_status (by content hash)?
                 sanitized_text = sanitize_text_for_encoding(text)
                 content_doc_id = compute_mdhash_id(sanitized_text, prefix="doc-")
-                existing_doc = await rag.doc_status.get_by_id(content_doc_id)
-                if existing_doc:
-                    # Content already exists, return duplicated with existing track_id
-                    status = existing_doc.get("status", "unknown")
-                    existing_track_id = existing_doc.get("track_id") or ""
-                    return InsertResponse(
-                        status="duplicated",
-                        message=f"Identical content already exists in document storage (doc_id: {content_doc_id}, Status: {status}).",
-                        track_id=existing_track_id,
+                existing = await rag.doc_status.get_by_id(content_doc_id)
+                if existing:
+                    skipped_messages.append(
+                        f"content for '{file_source or 'unknown_source'}' "
+                        f"duplicates existing doc {content_doc_id} "
+                        f"(status: {existing.get('status', 'unknown')})"
                     )
+                    continue
+                # Survived both checks → enqueue.
+                new_texts.append(text)
+                new_sources.append(file_source)
 
-            # Generate track_id for texts insertion
+            n_total = len(request.texts)
+            n_new = len(new_texts)
+            n_dup = n_total - n_new
+
+            # Truncate the skipped-messages list in the response so we
+            # don't dump 100s of skip reasons when batches are large.
+            joined_skips = "; ".join(skipped_messages[:5]) + (
+                f"; ... ({len(skipped_messages) - 5} more)"
+                if len(skipped_messages) > 5
+                else ""
+            )
+
+            if n_new == 0:
+                # All duplicates — preserve the legacy `status="duplicated"`
+                # so callers special-casing this still work.
+                return InsertResponse(
+                    status="duplicated",
+                    message=(
+                        f"All {n_total} texts are duplicates. {joined_skips}"
+                    ),
+                    track_id="",
+                )
+
             track_id = generate_track_id("insert")
+            # Pass file_sources=None when caller didn't supply them, to
+            # preserve original "no file_sources" behavior downstream.
+            new_file_sources = new_sources if request.file_sources else None
 
             background_tasks.add_task(
                 pipeline_index_texts,
                 rag,
-                request.texts,
-                file_sources=request.file_sources,
+                new_texts,
+                file_sources=new_file_sources,
                 track_id=track_id,
             )
 
+            if n_dup == 0:
+                return InsertResponse(
+                    status="success",
+                    message=(
+                        f"All {n_total} texts received. "
+                        "Processing will continue in background."
+                    ),
+                    track_id=track_id,
+                )
             return InsertResponse(
-                status="success",
-                message="Texts successfully received. Processing will continue in background.",
+                status="partial_success",
+                message=(
+                    f"{n_new} of {n_total} texts received "
+                    f"(track_id={track_id}); {n_dup} skipped as duplicates: "
+                    f"{joined_skips}"
+                ),
                 track_id=track_id,
             )
         except Exception as e:
